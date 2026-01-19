@@ -24,10 +24,10 @@ if "prompt_results" not in st.session_state:
 if "is_running" not in st.session_state:
     st.session_state.is_running = False
 
-# 模型选项
-AVAILABLE_MODELS = {
-    "豆包": "doubao_openai_compat",
-    "Gemini": "gemini"
+# 模型选项（基础）
+BASE_MODEL_KEYS = {
+    "doubao": "doubao_openai_compat",
+    "gemini": "gemini"
 }
 
 # 可选任务（用于输出展示）
@@ -141,6 +141,14 @@ def run_model_call(
             model_name=configs.get("doubao_model", ""),
             timeout_s=timeout_s
         )
+    if model_key == "custom_openai_compat":
+        return call_doubao_openai_compat(
+            prompt=prompt,
+            api_key=configs.get("custom_api_key", ""),
+            base_url=configs.get("custom_base_url", ""),
+            model_name=configs.get("custom_model", ""),
+            timeout_s=timeout_s
+        )
     if model_key == "gemini":
         return call_gemini(
             prompt=prompt,
@@ -187,6 +195,12 @@ with st.sidebar:
     timeout_s = st.number_input("请求超时(秒)", min_value=5, max_value=120, value=30, step=5)
 
     st.subheader("豆包")
+    if "doubao_display_name" not in st.session_state:
+        st.session_state.doubao_display_name = "豆包"
+    st.session_state.doubao_display_name = st.text_input(
+        "豆包 显示名",
+        value=st.session_state.doubao_display_name
+    )
     doubao_api_key = st.text_input("豆包 API Key", type="password")
     doubao_base_url = st.text_input(
         "豆包 Base URL",
@@ -200,12 +214,51 @@ with st.sidebar:
     )
 
     st.subheader("Gemini")
+    if "gemini_display_name" not in st.session_state:
+        st.session_state.gemini_display_name = "Gemini"
+    st.session_state.gemini_display_name = st.text_input(
+        "Gemini 显示名",
+        value=st.session_state.gemini_display_name
+    )
     gemini_api_key = st.text_input("Gemini API Key", type="password")
     gemini_model = st.text_input(
         "Gemini 模型名",
         value="gemini-1.5-pro",
         help="示例: gemini-1.5-pro"
     )
+
+    st.subheader("更多模型")
+    if "custom_models" not in st.session_state:
+        st.session_state.custom_models = []
+    if st.button("➕ 添加模型"):
+        st.session_state.custom_models.append(
+            {
+                "name": "",
+                "api_key": "",
+                "base_url": "",
+                "model": ""
+            }
+        )
+    custom_configs = {}
+    custom_model_labels = []
+    for idx, cfg in enumerate(st.session_state.custom_models):
+        st.markdown(f"**自定义模型 {idx + 1}**")
+        name = st.text_input("模型显示名", value=cfg.get("name", ""), key=f"custom_name_{idx}")
+        api_key = st.text_input("API Key", value=cfg.get("api_key", ""), type="password", key=f"custom_key_{idx}")
+        base_url = st.text_input("Base URL", value=cfg.get("base_url", ""), key=f"custom_base_{idx}")
+        model = st.text_input("模型名", value=cfg.get("model", ""), key=f"custom_model_{idx}")
+        if st.button("删除该模型", key=f"custom_delete_{idx}"):
+            st.session_state.custom_models.pop(idx)
+            st.rerun()
+        st.divider()
+        if name.strip():
+            label = f"{name.strip()}（自定义）"
+            custom_model_labels.append(label)
+            custom_configs[label] = {
+                "api_key": api_key,
+                "base_url": base_url,
+                "model": model
+            }
 
     with st.expander("评测 Prompt 模板（高级设置）", expanded=False):
         prompt_template = st.text_area(
@@ -240,13 +293,18 @@ tab_input, tab_output = st.tabs(["评测输入与调试", "输出结果"])
 
 
 with tab_input:
+    available_models = {
+        st.session_state.doubao_display_name: BASE_MODEL_KEYS["doubao"],
+        st.session_state.gemini_display_name: BASE_MODEL_KEYS["gemini"]
+    }
+    model_options = list(available_models.keys()) + custom_model_labels
     st.subheader("① 筛选与任务选择")
     col_a, col_b = st.columns([2, 2])
     with col_a:
         selected_models = st.multiselect(
             "选择模型（支持多选）",
-            options=list(AVAILABLE_MODELS.keys()),
-            default=list(AVAILABLE_MODELS.keys()),
+            options=model_options,
+            default=list(available_models.keys()),
             key="selected_models"
         )
     with col_b:
@@ -429,12 +487,21 @@ with tab_input:
             for item in all_prompts:
                 for model_display in selected_models:
                     current += 1
-                    model_key = AVAILABLE_MODELS[model_display]
+                    model_key = available_models.get(model_display, "custom_openai_compat")
                     status.text(f"🔄 Prompt 调试：{model_display}（{current}/{total}）")
+                    run_configs = configs
+                    if model_key == "custom_openai_compat":
+                        custom_cfg = custom_configs.get(model_display, {})
+                        run_configs = {
+                            **configs,
+                            "custom_api_key": custom_cfg.get("api_key", ""),
+                            "custom_base_url": custom_cfg.get("base_url", ""),
+                            "custom_model": custom_cfg.get("model", "")
+                        }
                     answer = run_model_call(
                         model_key=model_key,
                         prompt=item["prompt"],
-                        configs=configs,
+                        configs=run_configs,
                         use_mock=use_mock,
                         timeout_s=int(timeout_s)
                     )
@@ -461,13 +528,22 @@ with tab_input:
             for row in rows:
                 for model_display in selected_models:
                     current += 1
-                    model_key = AVAILABLE_MODELS[model_display]
+                    model_key = available_models.get(model_display, "custom_openai_compat")
                     prompt = build_prompt(row, prompt_template)
                     status.text(f"🔄 评测：{model_display}（{current}/{total}）")
+                    run_configs = configs
+                    if model_key == "custom_openai_compat":
+                        custom_cfg = custom_configs.get(model_display, {})
+                        run_configs = {
+                            **configs,
+                            "custom_api_key": custom_cfg.get("api_key", ""),
+                            "custom_base_url": custom_cfg.get("base_url", ""),
+                            "custom_model": custom_cfg.get("model", "")
+                        }
                     new_answer = run_model_call(
                         model_key=model_key,
                         prompt=prompt,
-                        configs=configs,
+                        configs=run_configs,
                         use_mock=use_mock,
                         timeout_s=int(timeout_s)
                     )
