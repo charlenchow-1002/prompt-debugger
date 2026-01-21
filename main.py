@@ -2,6 +2,7 @@ import io
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from typing import Dict, List
 
@@ -101,12 +102,14 @@ def call_gemini(
     prompt: str,
     api_key: str,
     model_name: str,
+    base_url: str,
     timeout_s: int
 ) -> str:
     if not api_key:
         return "❌ 缺少 Gemini API Key"
+    api_base = base_url.strip() or "https://generativelanguage.googleapis.com"
     endpoint = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{api_base.rstrip('/')}/v1beta/models/"
         f"{model_name}:generateContent?key={api_key}"
     )
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -154,9 +157,29 @@ def run_model_call(
             prompt=prompt,
             api_key=configs.get("gemini_api_key", ""),
             model_name=configs.get("gemini_model", ""),
+            base_url=configs.get("gemini_base_url", ""),
             timeout_s=timeout_s
         )
     return "❌ 未知模型"
+
+
+def get_model_key_and_configs(
+    model_display: str,
+    base_configs: Dict[str, str],
+    available_models: Dict[str, str],
+    custom_configs: Dict[str, Dict[str, str]]
+) -> (str, Dict[str, str]):
+    model_key = available_models.get(model_display, "custom_openai_compat")
+    run_configs = base_configs
+    if model_key == "custom_openai_compat":
+        custom_cfg = custom_configs.get(model_display, {})
+        run_configs = {
+            **base_configs,
+            "custom_api_key": custom_cfg.get("api_key", ""),
+            "custom_base_url": custom_cfg.get("base_url", ""),
+            "custom_model": custom_cfg.get("model", "")
+        }
+    return model_key, run_configs
 
 
 def calc_tasks(new_answer: str, row: Dict[str, str], task_keys: List[str]) -> Dict[str, str]:
@@ -193,6 +216,7 @@ with st.sidebar:
     st.header("🔧 模型配置")
     use_mock = st.checkbox("没有 Key 时使用模拟模式", value=True)
     timeout_s = st.number_input("请求超时(秒)", min_value=5, max_value=120, value=30, step=5)
+    concurrency = st.number_input("并发数", min_value=1, max_value=20, value=1, step=1)
 
     st.subheader("豆包")
     if "doubao_display_name" not in st.session_state:
@@ -221,6 +245,11 @@ with st.sidebar:
         value=st.session_state.gemini_display_name
     )
     gemini_api_key = st.text_input("Gemini API Key", type="password")
+    gemini_base_url = st.text_input(
+        "Gemini Base URL",
+        value="https://generativelanguage.googleapis.com",
+        help="示例: https://generativelanguage.googleapis.com"
+    )
     gemini_model = st.text_input(
         "Gemini 模型名",
         value="gemini-1.5-pro",
@@ -474,6 +503,7 @@ with tab_input:
             "doubao_base_url": doubao_base_url,
             "doubao_model": doubao_model,
             "gemini_api_key": gemini_api_key,
+            "gemini_base_url": gemini_base_url,
             "gemini_model": gemini_model
         }
 
@@ -484,36 +514,45 @@ with tab_input:
             progress = st.progress(0)
             status = st.empty()
             prompt_rows = []
+            tasks = []
             for item in all_prompts:
                 for model_display in selected_models:
+                    tasks.append((item, model_display))
+
+            def run_prompt_task(task):
+                item, model_display = task
+                model_key, run_configs = get_model_key_and_configs(
+                    model_display, configs, available_models, custom_configs
+                )
+                answer = run_model_call(
+                    model_key=model_key,
+                    prompt=item["prompt"],
+                    configs=run_configs,
+                    use_mock=use_mock,
+                    timeout_s=int(timeout_s)
+                )
+                return {
+                    "session_id": item.get("session_id", ""),
+                    "prompt": item["prompt"],
+                    "model": model_display,
+                    "answer": answer
+                }
+
+            if int(concurrency) <= 1:
+                for task in tasks:
                     current += 1
-                    model_key = available_models.get(model_display, "custom_openai_compat")
-                    status.text(f"🔄 Prompt 调试：{model_display}（{current}/{total}）")
-                    run_configs = configs
-                    if model_key == "custom_openai_compat":
-                        custom_cfg = custom_configs.get(model_display, {})
-                        run_configs = {
-                            **configs,
-                            "custom_api_key": custom_cfg.get("api_key", ""),
-                            "custom_base_url": custom_cfg.get("base_url", ""),
-                            "custom_model": custom_cfg.get("model", "")
-                        }
-                    answer = run_model_call(
-                        model_key=model_key,
-                        prompt=item["prompt"],
-                        configs=run_configs,
-                        use_mock=use_mock,
-                        timeout_s=int(timeout_s)
-                    )
-                    prompt_rows.append(
-                        {
-                            "session_id": item.get("session_id", ""),
-                            "prompt": item["prompt"],
-                            "model": model_display,
-                            "answer": answer
-                        }
-                    )
+                    status.text(f"🔄 Prompt 调试：{task[1]}（{current}/{total}）")
+                    prompt_rows.append(run_prompt_task(task))
                     progress.progress(min(current / total, 1.0))
+            else:
+                with ThreadPoolExecutor(max_workers=int(concurrency)) as executor:
+                    future_map = {executor.submit(run_prompt_task, task): task for task in tasks}
+                    for future in as_completed(future_map):
+                        current += 1
+                        task = future_map[future]
+                        status.text(f"🔄 Prompt 调试：{task[1]}（{current}/{total}）")
+                        prompt_rows.append(future.result())
+                        progress.progress(min(current / total, 1.0))
             st.session_state.prompt_results = pd.DataFrame(prompt_rows)
 
         if can_run_eval:
@@ -525,42 +564,51 @@ with tab_input:
             progress = st.progress(0)
             status = st.empty()
             output_rows = []
+            tasks = []
             for row in rows:
                 for model_display in selected_models:
+                    tasks.append((row, model_display))
+
+            def run_eval_task(task):
+                row, model_display = task
+                model_key, run_configs = get_model_key_and_configs(
+                    model_display, configs, available_models, custom_configs
+                )
+                prompt = build_prompt(row, prompt_template)
+                new_answer = run_model_call(
+                    model_key=model_key,
+                    prompt=prompt,
+                    configs=run_configs,
+                    use_mock=use_mock,
+                    timeout_s=int(timeout_s)
+                )
+                task_result = calc_tasks(new_answer, row, task_keys)
+                return {
+                    "session_id": row.get("session_id", ""),
+                    "message_id": row.get("message_id", ""),
+                    "query": row.get("query", ""),
+                    "rag": row.get("rag", ""),
+                    "raw_answer": row.get("raw_answer", ""),
+                    "model": model_display,
+                    "new_answer": new_answer,
+                    **task_result
+                }
+
+            if int(concurrency) <= 1:
+                for task in tasks:
                     current += 1
-                    model_key = available_models.get(model_display, "custom_openai_compat")
-                    prompt = build_prompt(row, prompt_template)
-                    status.text(f"🔄 评测：{model_display}（{current}/{total}）")
-                    run_configs = configs
-                    if model_key == "custom_openai_compat":
-                        custom_cfg = custom_configs.get(model_display, {})
-                        run_configs = {
-                            **configs,
-                            "custom_api_key": custom_cfg.get("api_key", ""),
-                            "custom_base_url": custom_cfg.get("base_url", ""),
-                            "custom_model": custom_cfg.get("model", "")
-                        }
-                    new_answer = run_model_call(
-                        model_key=model_key,
-                        prompt=prompt,
-                        configs=run_configs,
-                        use_mock=use_mock,
-                        timeout_s=int(timeout_s)
-                    )
-                    task_result = calc_tasks(new_answer, row, task_keys)
-                    output_rows.append(
-                        {
-                            "session_id": row.get("session_id", ""),
-                            "message_id": row.get("message_id", ""),
-                            "query": row.get("query", ""),
-                            "rag": row.get("rag", ""),
-                            "raw_answer": row.get("raw_answer", ""),
-                            "model": model_display,
-                            "new_answer": new_answer,
-                            **task_result
-                        }
-                    )
+                    status.text(f"🔄 评测：{task[1]}（{current}/{total}）")
+                    output_rows.append(run_eval_task(task))
                     progress.progress(min(current / total, 1.0))
+            else:
+                with ThreadPoolExecutor(max_workers=int(concurrency)) as executor:
+                    future_map = {executor.submit(run_eval_task, task): task for task in tasks}
+                    for future in as_completed(future_map):
+                        current += 1
+                        task = future_map[future]
+                        status.text(f"🔄 评测：{task[1]}（{current}/{total}）")
+                        output_rows.append(future.result())
+                        progress.progress(min(current / total, 1.0))
             st.session_state.eval_results = pd.DataFrame(output_rows)
 
         st.session_state.is_running = False
@@ -612,12 +660,12 @@ with tab_output:
 
             if model_col and answer_col:
                 if st.session_state.eval_session_pick != "全部":
-                    session_rows = display_df.drop_duplicates(subset=["session_id", "message_id"])
                     session_fields = ["session_id", "message_id", "query", "rag", "raw_answer"]
-                    session_fields = [c for c in session_fields if c in session_rows.columns]
+                    session_fields = [c for c in session_fields if c in display_df.columns]
+                    session_rows = display_df[session_fields].drop_duplicates(subset=session_fields)
                     st.subheader("原始输入数据")
                     st.dataframe(
-                        session_rows[session_fields],
+                        session_rows,
                         use_container_width=True,
                         height=200
                     )
@@ -657,7 +705,7 @@ with tab_output:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-        st.info("还没有评测结果，先去“评测输入与调试”里点击开始评测。")
+            st.info("还没有评测结果，先去“评测输入与调试”里点击开始评测。")
 
     st.markdown("---")
     st.subheader("Prompt 调试输出结果")
